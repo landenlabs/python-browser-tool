@@ -19,22 +19,37 @@
     Release version, e.g. v0.07.00 (the leading 'v' is optional).
 
 .PARAMETER Message
-    Git commit message (also used as the annotated tag message).
+    Git commit message (also used as the annotated tag message). Can be passed
+    as a single quoted string or as multiple unquoted words — all remaining
+    arguments after the version are joined with single spaces.
 
 .EXAMPLE
     .\set-version.ps1 v0.07.00 "Add Firefox support"
 
 .EXAMPLE
-    .\set-version.ps1 0.7.1 "Fix Windows ACL crash"
+    .\set-version.ps1 v0.07.00 'Fix Windows ACL crash'
+
+.EXAMPLE
+    .\set-version.ps1 v0.07.00 Add Firefox support
 #>
 
 param(
     [Parameter(Mandatory=$true, Position=0)]
     [string]$Version,
 
-    [Parameter(Mandatory=$true, Position=1)]
-    [string]$Message
+    [Parameter(Mandatory=$true, Position=1, ValueFromRemainingArguments=$true)]
+    [string[]]$MessageParts
 )
+
+# Accept the commit message as either a single quoted string or as multiple
+# unquoted tokens. ValueFromRemainingArguments collects whatever's left into
+# an array; joining with a single space reconstructs the intended sentence
+# (collapsing any incidental multiple whitespace at the shell level).
+$Message = ($MessageParts -join ' ').Trim()
+if ([string]::IsNullOrWhiteSpace($Message)) {
+    Write-Host "ERROR: Commit message is required." -ForegroundColor Red
+    exit 1
+}
 
 $ErrorActionPreference = 'Stop'
 
@@ -106,12 +121,16 @@ if (-not (Test-Path $pyFile)) { Fail "Python file not found: $pyFile" }
 
 $pyContent = Read-File $pyFile
 $pyPattern = 'VERSION\s*=\s*"v\d+\.\d+\.\d+\s*\([^)]+\)"'
-$pyNew     = [regex]::Replace($pyContent, $pyPattern, "VERSION = `"$versionWithDate`"")
-if ($pyNew -eq $pyContent) {
+if (-not [regex]::IsMatch($pyContent, $pyPattern)) {
     Fail "No VERSION line matching $pyPattern found in $pyFile"
 }
-Write-File $pyFile $pyNew
-Write-Host "  updated brow-tool.py    -> VERSION = `"$versionWithDate`""
+$pyNew = [regex]::Replace($pyContent, $pyPattern, "VERSION = `"$versionWithDate`"")
+if ($pyNew -eq $pyContent) {
+    Write-Host "  brow-tool.py already at VERSION = `"$versionWithDate`" (no change)" -ForegroundColor DarkGray
+} else {
+    Write-File $pyFile $pyNew
+    Write-Host "  updated brow-tool.py    -> VERSION = `"$versionWithDate`""
+}
 
 # ---------------------------------------------------------------------------
 # 2. README.md
@@ -119,15 +138,24 @@ Write-Host "  updated brow-tool.py    -> VERSION = `"$versionWithDate`""
 
 $readme = Join-Path $ProjectRoot 'README.md'
 if (Test-Path $readme) {
-    $rmContent = Read-File $readme
-    $rmNew = $rmContent
-    $rmNew = [regex]::Replace($rmNew, '(<!-- VERSION -->)v?\d+\.\d+\.\d+', "`${1}$Version")
-    $rmNew = [regex]::Replace($rmNew, '(<!-- DATE -->)[\w\-]+',           "`${1}$dateForReadme")
-    if ($rmNew -eq $rmContent) {
-        Write-Host "  WARNING: No <!-- VERSION --> / <!-- DATE --> markers updated in README.md" -ForegroundColor Yellow
+    $rmContent  = Read-File $readme
+    $verMarker  = '(<!-- VERSION -->)v?\d+\.\d+\.\d+'
+    $dateMarker = '(<!-- DATE -->)[\w\-]+'
+
+    $hasVerMarker  = [regex]::IsMatch($rmContent, $verMarker)
+    $hasDateMarker = [regex]::IsMatch($rmContent, $dateMarker)
+    if (-not ($hasVerMarker -or $hasDateMarker)) {
+        Write-Host "  WARNING: No <!-- VERSION --> / <!-- DATE --> markers found in README.md" -ForegroundColor Yellow
     } else {
-        Write-File $readme $rmNew
-        Write-Host "  updated README.md       -> $Version, $dateForReadme"
+        $rmNew = $rmContent
+        $rmNew = [regex]::Replace($rmNew, $verMarker,  "`${1}$Version")
+        $rmNew = [regex]::Replace($rmNew, $dateMarker, "`${1}$dateForReadme")
+        if ($rmNew -eq $rmContent) {
+            Write-Host "  README.md already at $Version, $dateForReadme (no change)" -ForegroundColor DarkGray
+        } else {
+            Write-File $readme $rmNew
+            Write-Host "  updated README.md       -> $Version, $dateForReadme"
+        }
     }
 }
 
