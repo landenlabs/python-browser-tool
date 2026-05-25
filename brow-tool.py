@@ -9,7 +9,7 @@ import sys
 import traceback
 from pathlib import Path
 
-VERSION = "v0.06.00 (May-2026)"
+VERSION = "v6.05.23 (May-2026)"
 
 
 # ---------------------------------------------------------------------------
