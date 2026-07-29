@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------
+# Copyright (c) 2026 LanDen Labs - Dennis Lang
+# https://landenlabs.com
+# ----------------------------------------------------------------------
 """brow-tool - Browser directory analysis and forensics tool"""
 
 import argparse
@@ -86,6 +90,12 @@ def get_default_chrome_paths():
         ]
 
     return [p for p in candidates if p.exists()]
+
+
+def get_default_chrome_path():
+    """Return the first existing default Chrome User Data location for the current OS, or None."""
+    paths = get_default_chrome_paths()
+    return paths[0] if paths else None
 
 
 # ---------------------------------------------------------------------------
@@ -433,22 +443,19 @@ def scan_chrome_directory(chrome_dir):
 
 
 def scan_chrome(chrome_arg):
-    """Dispatch a Chrome scan: explicit path, or all default OS locations."""
+    """Dispatch a Chrome scan: explicit path, or the first default OS location found."""
     if chrome_arg and chrome_arg != 'AUTO':
         return scan_chrome_directory(chrome_arg)
 
-    paths = get_default_chrome_paths()
-    if not paths:
+    path = get_default_chrome_path()
+    if not path:
         print(f"[-] No Chrome installation found in standard locations "
               f"for {platform.system()}.", file=sys.stderr)
         return 0
 
-    print(f"[*] No --chrome path given; scanning {len(paths)} default location(s) "
-          f"for {platform.system()}.\n")
-    total = 0
-    for p in paths:
-        total += scan_chrome_directory(str(p))
-    return total
+    print(f"[*] No --chrome path given; using default location for "
+          f"{platform.system()}: {path}\n")
+    return scan_chrome_directory(str(path))
 
 
 # ---------------------------------------------------------------------------
@@ -586,22 +593,19 @@ def list_chrome_profiles_directory(chrome_dir, show_extensions=True, show_space=
 
 
 def list_chrome_profiles(chrome_arg, show_extensions=True, show_space=False):
-    """Dispatch a Chrome profile listing: explicit path, or default OS locations."""
+    """Dispatch a Chrome profile listing: explicit path, or the first default OS location found."""
     if chrome_arg and chrome_arg != 'AUTO':
         return list_chrome_profiles_directory(chrome_arg, show_extensions, show_space)
 
-    paths = get_default_chrome_paths()
-    if not paths:
+    path = get_default_chrome_path()
+    if not path:
         print(f"[-] No Chrome installation found in standard locations "
               f"for {platform.system()}.", file=sys.stderr)
         return 0
 
-    print(f"[*] No --chrome path given; listing profiles from {len(paths)} "
-          f"default location(s) for {platform.system()}.\n")
-    total = 0
-    for p in paths:
-        total += list_chrome_profiles_directory(str(p), show_extensions, show_space)
-    return total
+    print(f"[*] No --chrome path given; using default location for "
+          f"{platform.system()}: {path}\n")
+    return list_chrome_profiles_directory(str(path), show_extensions, show_space)
 
 
 # ---------------------------------------------------------------------------
@@ -699,22 +703,19 @@ def clean_chrome_directory(chrome_dir, target, assume_yes=False):
 
 
 def clean_chrome(chrome_arg, target, assume_yes=False):
-    """Dispatch a Chrome clean: explicit path, or default OS locations."""
+    """Dispatch a Chrome clean: explicit path, or the first default OS location found."""
     if chrome_arg and chrome_arg != 'AUTO':
         return clean_chrome_directory(chrome_arg, target, assume_yes)
 
-    paths = get_default_chrome_paths()
-    if not paths:
+    path = get_default_chrome_path()
+    if not path:
         print(f"[-] No Chrome installation found in standard locations "
               f"for {platform.system()}.", file=sys.stderr)
         return 0
 
-    print(f"[*] No --chrome path given; cleaning profiles in {len(paths)} "
-          f"default location(s) for {platform.system()}.\n")
-    total = 0
-    for p in paths:
-        total += clean_chrome_directory(str(p), target, assume_yes)
-    return total
+    print(f"[*] No --chrome path given; using default location for "
+          f"{platform.system()}: {path}\n")
+    return clean_chrome_directory(str(path), target, assume_yes)
 
 
 # ---------------------------------------------------------------------------
@@ -725,7 +726,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=f"brow-tool {VERSION}\nBrowser directory analysis and forensics tool.",
         epilog="""Examples:
-  # Scan Chrome at the default OS-specific User Data location(s):
+  # Scan Chrome at the first default OS-specific User Data location found:
   brow-tool.py --summary --chrome
 
   # List profiles with installed/enabled extension counts:
@@ -749,7 +750,8 @@ def main():
   brow-tool.py --summary --chrome ~/.config/google-chrome
   brow-tool.py --summary --chrome "~/Library/Application Support/Google/Chrome"
 
-Default locations searched when --chrome is given without a path:
+Default locations checked (in order) when --chrome is given without a path;
+the first one that exists is used:
   Windows:  %LOCALAPPDATA%\\Google\\Chrome\\User Data
             %LOCALAPPDATA%\\Google\\Chrome Beta\\User Data
             %LOCALAPPDATA%\\Google\\Chrome SxS\\User Data   (Canary)
@@ -812,8 +814,8 @@ Notes:
         const='AUTO',
         default=None,
         metavar='PATH',
-        help='Scan Chrome. With no value, uses the OS default User Data location(s); '
-             'with a value, scans the given path.',
+        help='Scan Chrome. With no value, uses the first existing OS default User Data '
+             'location; with a value, scans the given path.',
     )
     parser.add_argument(
         '--no-color', action='store_true',
