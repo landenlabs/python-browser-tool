@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import platform
+import shutil
 import sys
 import traceback
 from pathlib import Path
@@ -203,6 +204,36 @@ def _safe_exists(path):
         return path.exists()
     except (PermissionError, OSError):
         return False
+
+
+def compute_dir_size(path):
+    """Recursively sum file sizes under path, skipping inaccessible entries and symlinks."""
+    total = 0
+    try:
+        entries = list(os.scandir(path))
+    except (PermissionError, OSError):
+        return 0
+    for entry in entries:
+        try:
+            if entry.is_symlink():
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                total += compute_dir_size(entry.path)
+            else:
+                total += entry.stat(follow_symlinks=False).st_size
+        except (PermissionError, OSError):
+            continue
+    return total
+
+
+def format_size(num_bytes):
+    """Human-readable size string, e.g. '512 B', '4.3 MB', '1.2 GB'."""
+    size = float(num_bytes)
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit == 'B' else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
 
 
 def get_chrome_version(root_path):
@@ -482,8 +513,8 @@ def count_profile_extensions(profile_dir, min_mv=None):
     return len(installed), enabled, unsupported
 
 
-def list_chrome_profiles_directory(chrome_dir):
-    """List profiles in a Chrome user-data folder with extension counts."""
+def list_chrome_profiles_directory(chrome_dir, show_extensions=True, show_space=False):
+    """List profiles in a Chrome user-data folder with extension counts and/or disk space."""
     root_path = Path(chrome_dir)
     if not _safe_exists(root_path):
         print(f"[-] Error: The path '{chrome_dir}' does not exist.", file=sys.stderr)
@@ -507,8 +538,11 @@ def list_chrome_profiles_directory(chrome_dir):
             continue
 
         display = profile_names.get(profile_item.name, '')
-        installed, enabled, unsupported = count_profile_extensions(profile_item, min_mv)
-        rows.append((profile_item.name, display, installed, enabled, unsupported))
+        installed = enabled = unsupported = 0
+        if show_extensions:
+            installed, enabled, unsupported = count_profile_extensions(profile_item, min_mv)
+        size = compute_dir_size(profile_item) if show_space else 0
+        rows.append((profile_item.name, display, installed, enabled, unsupported, size))
 
     if not rows:
         print("  (no profiles found)\n")
@@ -517,31 +551,44 @@ def list_chrome_profiles_directory(chrome_dir):
     name_w    = max(len("Profile"),      max(len(r[0]) for r in rows))
     display_w = max(len("Display Name"), max(len(r[1]) for r in rows))
     unsup_label = "Unsupported" if min_mv is not None else "Unsupported*"
+    size_w = max(len("Disk Space"), max((len(format_size(r[5])) for r in rows), default=0)) \
+        if show_space else 0
 
-    header = (f"  {'Profile'.ljust(name_w)}   "
-              f"{'Display Name'.ljust(display_w)}   "
-              f"Installed   Enabled   {unsup_label}")
-    sep = (f"  {'-' * name_w}   {'-' * display_w}   "
-           f"---------   -------   {'-' * len(unsup_label)}")
+    header = f"  {'Profile'.ljust(name_w)}   {'Display Name'.ljust(display_w)}"
+    sep    = f"  {'-' * name_w}   {'-' * display_w}"
+    if show_extensions:
+        header += f"   Installed   Enabled   {unsup_label}"
+        sep    += f"   ---------   -------   {'-' * len(unsup_label)}"
+    if show_space:
+        header += f"   {'Disk Space'.rjust(size_w)}"
+        sep    += f"   {'-' * size_w}"
     print(header)
     print(sep)
-    for name, display, installed, enabled, unsupported in rows:
-        unsup_cell = f"{unsupported:>{len(unsup_label)}}"
-        if min_mv is not None and unsupported > 0:
-            unsup_cell = _c(unsup_cell, _RED)
-        print(f"  {name.ljust(name_w)}   "
-              f"{display.ljust(display_w)}   "
-              f"{installed:>9}   {enabled:>7}   {unsup_cell}")
-    if min_mv is None:
+
+    total_size = 0
+    for name, display, installed, enabled, unsupported, size in rows:
+        line = f"  {name.ljust(name_w)}   {display.ljust(display_w)}"
+        if show_extensions:
+            unsup_cell = f"{unsupported:>{len(unsup_label)}}"
+            if min_mv is not None and unsupported > 0:
+                unsup_cell = _c(unsup_cell, _RED)
+            line += f"   {installed:>9}   {enabled:>7}   {unsup_cell}"
+        if show_space:
+            line += f"   {format_size(size).rjust(size_w)}"
+            total_size += size
+        print(line)
+    if show_extensions and min_mv is None:
         print("\n  * Cannot evaluate: Chrome version unknown, so no minimum manifest_version baseline.")
+    if show_space:
+        print(f"\n  Total disk space: {format_size(total_size)}")
     print()
     return len(rows)
 
 
-def list_chrome_profiles(chrome_arg):
+def list_chrome_profiles(chrome_arg, show_extensions=True, show_space=False):
     """Dispatch a Chrome profile listing: explicit path, or default OS locations."""
     if chrome_arg and chrome_arg != 'AUTO':
-        return list_chrome_profiles_directory(chrome_arg)
+        return list_chrome_profiles_directory(chrome_arg, show_extensions, show_space)
 
     paths = get_default_chrome_paths()
     if not paths:
@@ -553,7 +600,120 @@ def list_chrome_profiles(chrome_arg):
           f"default location(s) for {platform.system()}.\n")
     total = 0
     for p in paths:
-        total += list_chrome_profiles_directory(str(p))
+        total += list_chrome_profiles_directory(str(p), show_extensions, show_space)
+    return total
+
+
+# ---------------------------------------------------------------------------
+# Profile cleaning
+# ---------------------------------------------------------------------------
+
+CLEAN_TARGETS = ['Cache', 'Download Service', 'Service Worker', 'Sessions', 'Cookies', 'History']
+
+
+def _path_size(path):
+    """Size of a file, or recursive size of a directory."""
+    try:
+        if path.is_dir():
+            return compute_dir_size(path)
+        return path.stat().st_size
+    except (PermissionError, OSError):
+        return 0
+
+
+def _remove_path(path):
+    """Delete a file or directory tree."""
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _iter_profile_dirs(root_path):
+    """Yield (name, Path) for each standard profile dir under a Chrome User Data root."""
+    for profile_item in sorted(_safe_iterdir(root_path), key=lambda p: p.name.lower()):
+        try:
+            if not (profile_item.is_dir() and
+                    (profile_item.name == 'Default' or profile_item.name.startswith('Profile'))):
+                continue
+        except (PermissionError, OSError):
+            continue
+        yield profile_item.name, profile_item
+
+
+def clean_chrome_directory(chrome_dir, target, assume_yes=False):
+    """Remove Cache/Download Service/Service Worker/Sessions/Cookies/History for one or all profiles."""
+    root_path = Path(chrome_dir)
+    if not _safe_exists(root_path):
+        print(f"[-] Error: The path '{chrome_dir}' does not exist.", file=sys.stderr)
+        return 0
+
+    all_profiles = list(_iter_profile_dirs(root_path))
+    if target.lower() == 'all':
+        selected = all_profiles
+    else:
+        selected = [(n, p) for n, p in all_profiles if n.lower() == target.lower()]
+        if not selected:
+            print(f"[-] Error: Profile '{target}' not found under {root_path}.", file=sys.stderr)
+            return 0
+
+    to_remove = []
+    for name, profile_path in selected:
+        for sub in CLEAN_TARGETS:
+            sub_path = profile_path / sub
+            if _safe_exists(sub_path):
+                to_remove.append((name, sub_path))
+
+    if not to_remove:
+        print(f"[*] Nothing to clean in {root_path}.\n")
+        return 0
+
+    print(f"[*] The following will be removed from {root_path}:")
+    total_size = 0
+    sized = []
+    for name, sub_path in to_remove:
+        size = _path_size(sub_path)
+        total_size += size
+        sized.append((name, sub_path, size))
+    name_w = max(len(n) for n, _, _ in sized)
+    for name, sub_path, size in sized:
+        print(f"  {name.ljust(name_w)}   {sub_path.name:<16}   {format_size(size):>10}   {sub_path}")
+    print(f"\n  Total space to be reclaimed: {format_size(total_size)}\n")
+
+    if not assume_yes:
+        answer = input("Proceed with deletion? [y/N] ").strip().lower()
+        if answer not in ('y', 'yes'):
+            print("[*] Aborted, nothing removed.\n")
+            return 0
+
+    removed = 0
+    for _, sub_path, _ in sized:
+        try:
+            _remove_path(sub_path)
+            removed += 1
+        except OSError as err:
+            print(f"  [!] Failed to remove {sub_path}: {err}", file=sys.stderr)
+    print(f"\n[*] Removed {removed} of {len(sized)} item{'s' if len(sized) != 1 else ''}, "
+          f"reclaiming up to {format_size(total_size)}.\n")
+    return removed
+
+
+def clean_chrome(chrome_arg, target, assume_yes=False):
+    """Dispatch a Chrome clean: explicit path, or default OS locations."""
+    if chrome_arg and chrome_arg != 'AUTO':
+        return clean_chrome_directory(chrome_arg, target, assume_yes)
+
+    paths = get_default_chrome_paths()
+    if not paths:
+        print(f"[-] No Chrome installation found in standard locations "
+              f"for {platform.system()}.", file=sys.stderr)
+        return 0
+
+    print(f"[*] No --chrome path given; cleaning profiles in {len(paths)} "
+          f"default location(s) for {platform.system()}.\n")
+    total = 0
+    for p in paths:
+        total += clean_chrome_directory(str(p), target, assume_yes)
     return total
 
 
@@ -571,8 +731,18 @@ def main():
   # List profiles with installed/enabled extension counts:
   brow-tool.py --profiles --chrome
 
+  # List profiles with disk space used by each profile's directory tree:
+  brow-tool.py --space --chrome
+
   # Both at once:
   brow-tool.py --summary --profiles --chrome
+
+  # Remove Cache, Download Service, Service Worker, Sessions, Cookies, and History
+  # from every profile:
+  brow-tool.py --clean=all --chrome
+
+  # Remove those same items from just "Profile 1":
+  brow-tool.py --clean="Profile 1" --chrome
 
   # Scan a specific Chrome User Data directory:
   brow-tool.py --summary --chrome "%LOCALAPPDATA%\\Google\\Chrome\\User Data"
@@ -593,6 +763,14 @@ Default locations searched when --chrome is given without a path:
             ~/.config/google-chrome-unstable
             ~/.config/chromium
 
+--clean removes these items from each selected profile:
+  Cache             (directory)
+  Download Service  (directory)
+  Service Worker    (directory)
+  Sessions          (directory)
+  Cookies           (file)
+  History           (file)
+
 Notes:
   The --chrome path should point to the Chrome "User Data" directory, which
   contains profile subdirectories such as 'Default' and 'Profile 1'.
@@ -610,6 +788,23 @@ Notes:
         '--profiles',
         action='store_true',
         help='List profile dir, browser display name, and installed/enabled extension counts',
+    )
+    parser.add_argument(
+        '--space',
+        action='store_true',
+        help='Compute and show the disk space used by each profile\'s directory tree',
+    )
+    parser.add_argument(
+        '--clean',
+        metavar='all|PROFILE',
+        default=None,
+        help="Remove Cache, Download Service, Service Worker, Sessions, Cookies, and "
+             "History from 'all' profiles or a specific profile (e.g. 'Default', 'Profile 1')",
+    )
+    parser.add_argument(
+        '-y', '--yes',
+        action='store_true',
+        help='Skip the confirmation prompt when using --clean',
     )
     parser.add_argument(
         '--chrome',
@@ -634,14 +829,17 @@ Notes:
     if args.chrome is None:
         parser.error("at least one browser must be specified (e.g., --chrome)")
 
-    if not (args.summary or args.profiles):
-        parser.error("specify at least one of --summary or --profiles")
+    if not (args.summary or args.profiles or args.space or args.clean):
+        parser.error("specify at least one of --summary, --profiles, --space, or --clean")
 
-    if args.profiles:
-        list_chrome_profiles(args.chrome)
+    if args.profiles or args.space:
+        list_chrome_profiles(args.chrome, show_extensions=args.profiles, show_space=args.space)
 
     if args.summary:
         scan_chrome(args.chrome)
+
+    if args.clean:
+        clean_chrome(args.chrome, args.clean, assume_yes=args.yes)
 
 
 if __name__ == "__main__":
