@@ -12,6 +12,7 @@ import platform
 import shutil
 import sys
 import traceback
+from datetime import datetime, timedelta
 from pathlib import Path
 
 VERSION = "v6.05.23 (May-2026)"
@@ -195,6 +196,68 @@ def read_manifest_version(manifest_path):
         return None
 
 
+def load_extension_settings(profile_dir):
+    """
+    Return the merged 'extensions.settings' dict (ext_id -> info) for a profile.
+
+    Chrome historically stored per-extension settings (state, install_time, ...)
+    in 'Preferences'; newer versions moved them to 'Secure Preferences'. Merge
+    both so callers see settings regardless of which file the running Chrome
+    version uses.
+    """
+    settings = {}
+    for fname in ('Preferences', 'Secure Preferences'):
+        path = profile_dir / fname
+        if not _safe_exists(path):
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                data = json.load(f)
+            settings.update(data.get('extensions', {}).get('settings', {}) or {})
+        except (OSError, ValueError):
+            continue
+    return settings
+
+
+_CHROME_EPOCH = datetime(1601, 1, 1)
+
+
+def chrome_time_to_datetime(value):
+    """Convert a Chrome/WebKit timestamp (microseconds since 1601-01-01 UTC) to a datetime, or None."""
+    try:
+        micros = int(value)
+    except (TypeError, ValueError):
+        return None
+    if micros <= 0:
+        return None
+    try:
+        return _CHROME_EPOCH + timedelta(microseconds=micros)
+    except OverflowError:
+        return None
+
+
+def get_extension_install_date(ext_id, settings, manifest_path):
+    """
+    Return a display string for when an extension was installed.
+
+    Prefers the 'first_install_time' Chrome recorded for this extension in
+    Preferences / Secure Preferences; falls back to the manifest.json file's
+    creation time (birth time where the OS tracks it, else last metadata
+    change time) when Chrome has no install-time record.
+    """
+    info = settings.get(ext_id) or {}
+    installed = chrome_time_to_datetime(info.get('first_install_time'))
+    if installed:
+        return installed.strftime('%Y-%m-%d %H:%M:%S')
+
+    try:
+        stat = os.stat(manifest_path)
+        ts = getattr(stat, 'st_birthtime', None) or stat.st_ctime
+        return f"{datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')}  (manifest file date)"
+    except OSError:
+        return "Unknown"
+
+
 # ---------------------------------------------------------------------------
 # Chrome scanning
 # ---------------------------------------------------------------------------
@@ -351,8 +414,12 @@ def load_chrome_profile_names(root_path):
     return mapping
 
 
-def scan_chrome_directory(chrome_dir):
-    """Scan a Chrome user-data folder for profiles and their extensions."""
+def scan_chrome_directory(chrome_dir, profile_filter=None):
+    """Scan a Chrome user-data folder for profiles and their extensions.
+
+    profile_filter, if given, limits the scan to the one profile whose internal
+    name (e.g. 'Profile 10') or display name (e.g. 'Work') matches (case-insensitive).
+    """
     root_path = Path(chrome_dir)
     if not _safe_exists(root_path):
         print(f"[-] Error: The path '{chrome_dir}' does not exist.", file=sys.stderr)
@@ -367,6 +434,8 @@ def scan_chrome_directory(chrome_dir):
 
     extensions_found = 0
     skipped = 0
+    total_size = 0
+    profiles_matched = 0
 
     for profile_item in sorted(_safe_iterdir(root_path), key=lambda p: p.name.lower()):
         # Standard profiles are named 'Default' or 'Profile X'
@@ -377,15 +446,20 @@ def scan_chrome_directory(chrome_dir):
         except (PermissionError, OSError):
             continue
 
+        display = profile_names.get(profile_item.name, '')
+        if not _profile_matches(profile_item.name, display, profile_filter):
+            continue
+
         extensions_dir = profile_item / "Extensions"
         if not (_safe_exists(extensions_dir) and extensions_dir.is_dir()):
             continue
 
-        display = profile_names.get(profile_item.name)
+        profiles_matched += 1
         header_label = f'{profile_item.name}  ("{display}")' if display else profile_item.name
         profile_field = f'{profile_item.name}  ("{display}")' if display else profile_item.name
         print(f"=== Profile: {header_label} ===")
         profile_has_extensions = False
+        ext_settings = load_extension_settings(profile_item)
 
         for ext_id_dir in _safe_iterdir(extensions_dir):
             try:
@@ -411,6 +485,9 @@ def scan_chrome_directory(chrome_dir):
                 extensions_found += 1
 
                 name, version, desc, mv = get_extension_details(manifest_file)
+                size = compute_dir_size(version_dir)
+                total_size += size
+                install_date = get_extension_install_date(ext_id_dir.name, ext_settings, manifest_file)
 
                 if mv is None:
                     mv_display = "(none)"
@@ -423,6 +500,8 @@ def scan_chrome_directory(chrome_dir):
                 print(f"  Version          : {version}")
                 print(f"  Manifest Version : {mv_display}")
                 print(f"  Description      : {desc}")
+                print(f"  Disk Space       : {format_size(size)}")
+                print(f"  Install Date     : {install_date}")
                 print(f"  Profile          : {profile_field} (Enabled/Installed)")
                 print(f"  Path             : {manifest_file}")
                 print("-" * 50)
@@ -432,8 +511,15 @@ def scan_chrome_directory(chrome_dir):
             print("-" * 50)
         print()
 
+    if profile_filter and profiles_matched == 0:
+        print(f"  (no profile matching '{profile_filter}' found)\n")
+        return 0
+
     if extensions_found == 0:
         print("[-] No active profile extensions detected. (Component updates ignored)\n")
+    else:
+        print(f"[*] Total disk space used by {extensions_found} "
+              f"extension{'s' if extensions_found != 1 else ''}: {format_size(total_size)}\n")
 
     if skipped:
         print(f"[!] {skipped} extension entr{'y' if skipped == 1 else 'ies'} "
@@ -442,10 +528,10 @@ def scan_chrome_directory(chrome_dir):
     return extensions_found
 
 
-def scan_chrome(chrome_arg):
+def scan_chrome(chrome_arg, profile_filter=None):
     """Dispatch a Chrome scan: explicit path, or the first default OS location found."""
     if chrome_arg and chrome_arg != 'AUTO':
-        return scan_chrome_directory(chrome_arg)
+        return scan_chrome_directory(chrome_arg, profile_filter)
 
     path = get_default_chrome_path()
     if not path:
@@ -455,7 +541,7 @@ def scan_chrome(chrome_arg):
 
     print(f"[*] No --chrome path given; using default location for "
           f"{platform.system()}: {path}\n")
-    return scan_chrome_directory(str(path))
+    return scan_chrome_directory(str(path), profile_filter)
 
 
 # ---------------------------------------------------------------------------
@@ -494,15 +580,7 @@ def count_profile_extensions(profile_dir, min_mv=None):
             mv = read_manifest_version(version_dirs[0] / "manifest.json")
             installed[ext_id_dir.name] = mv
 
-    settings = {}
-    prefs = profile_dir / "Preferences"
-    if _safe_exists(prefs):
-        try:
-            with open(prefs, 'r', encoding='utf-8', errors='ignore') as f:
-                data = json.load(f)
-            settings = data.get('extensions', {}).get('settings', {}) or {}
-        except (OSError, ValueError):
-            settings = {}
+    settings = load_extension_settings(profile_dir)
 
     enabled = 0
     for ext_id in installed:
@@ -794,6 +872,10 @@ def main():
   # Scan Chrome at the first default OS-specific User Data location found:
   brow-tool.py --summary --chrome
 
+  # Same, but limited to one profile, by display name or internal name:
+  brow-tool.py --chrome --summary "Work"
+  brow-tool.py --chrome --summary "Profile 10"
+
   # List profiles with installed/enabled extension counts:
   brow-tool.py --profiles --chrome
 
@@ -865,8 +947,14 @@ Notes:
 
     parser.add_argument(
         '--summary',
-        action='store_true',
-        help='Provide a summary of profiles and their installed extensions',
+        nargs='?',
+        const='ALL',
+        default=None,
+        metavar='PROFILE',
+        help='Provide a summary of profiles and their installed extensions, including disk '
+             'space used by and install date of each. With no value, shows all profiles; '
+             "with a value, shows only the profile matching that internal name "
+             "(e.g. 'Profile 10') or display name (e.g. 'Work')",
     )
     parser.add_argument(
         '--profiles',
@@ -924,7 +1012,7 @@ Notes:
     if args.chrome is None:
         parser.error("at least one browser must be specified (e.g., --chrome)")
 
-    if not (args.summary or args.profiles or args.space is not None or args.clean):
+    if not (args.summary is not None or args.profiles or args.space is not None or args.clean):
         parser.error("specify at least one of --summary, --profiles, --space, or --clean")
 
     if args.profiles or args.space is not None:
@@ -932,8 +1020,9 @@ Notes:
         list_chrome_profiles(args.chrome, show_extensions=args.profiles, show_space=args.space is not None,
                               verbose=args.verbose, profile_filter=profile_filter)
 
-    if args.summary:
-        scan_chrome(args.chrome)
+    if args.summary is not None:
+        profile_filter = args.summary if args.summary != 'ALL' else None
+        scan_chrome(args.chrome, profile_filter=profile_filter)
 
     if args.clean:
         clean_chrome(args.chrome, args.clean, assume_yes=args.yes)
