@@ -1,211 +1,333 @@
-#!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-    Bump the project version, commit pending changes, then push commits and tag
-    to trigger the release workflow.
+    Bump a project's version, commit, tag, and push to trigger the CI release.
 
 .DESCRIPTION
-    Updates the version in:
-      1. brow-tool.py           (the VERSION = "..."  line)
-      2. README.md              (<!-- VERSION --> and <!-- DATE --> markers)
-      3. VERSION                (project version file)
+    Drop this script into any C#, Python, or C++ repo and run it from inside the
+    repo. It locates the repo root via git and auto-detects which version-bearing
+    files are present, updating each one if found and silently skipping the rest:
 
-    Then stages everything, commits with the supplied message, pushes the
-    commit, creates an annotated tag, and pushes the tag. The tag push is
-    intentionally last so the commit is already on the remote when the
-    tag-triggered GitHub Action starts building.
+        VERSION                     bare  X.Y.Z
+        README.md                   <!-- VERSION -->vX.Y.Z  and  <!-- DATE -->dd-MMM-yyyy
+        *.csproj                    <Version>X.Y.Z</Version>
+        version.py / __init__.py    __version__ = "X.Y.Z"
+        *.py (standalone scripts)   VERSION = "vX.Y.Z"  (hardcoded literal, no import)
+        *version_info*.py           filevers/prodvers tuples + FileVersion/ProductVersion
+        *.cpp / *.h / ...           #define VERSION / _VERSION "vX.Y.Z"
+        *.rc                        FILEVERSION/PRODUCTVERSION + strings + (C) year
 
-.PARAMETER Version
-    Release version, e.g. v0.07.00 (the leading 'v' is optional).
+    Then: git add -> commit -> annotated tag -> push branch -> push tag.
 
-.PARAMETER Message
-    Git commit message (also used as the annotated tag message). Can be passed
-    as a single quoted string or as multiple unquoted words — all remaining
-    arguments after the version are joined with single spaces.
-
-.EXAMPLE
-    .\set-version.ps1 v0.07.00 "Add Firefox support"
+    See SET-VERSION.md for the full reference.
 
 .EXAMPLE
-    .\set-version.ps1 v0.07.00 'Fix Windows ACL crash'
+    .\set-version.ps1 -version 1.2.3 -message "fix: long-path extraction"
 
 .EXAMPLE
-    .\set-version.ps1 v0.07.00 Add Firefox support
+    .\set-version.ps1 --version v3.0 --message 'release notes' --force
 #>
 
-param(
-    [Parameter(Mandatory=$true, Position=0)]
-    [string]$Version,
-
-    [Parameter(Mandatory=$true, Position=1, ValueFromRemainingArguments=$true)]
-    [string[]]$MessageParts
-)
-
-# Accept the commit message as either a single quoted string or as multiple
-# unquoted tokens. ValueFromRemainingArguments collects whatever's left into
-# an array; joining with a single space reconstructs the intended sentence
-# (collapsing any incidental multiple whitespace at the shell level).
-$Message = ($MessageParts -join ' ').Trim()
-if ([string]::IsNullOrWhiteSpace($Message)) {
-    Write-Host "ERROR: Commit message is required." -ForegroundColor Red
-    exit 1
-}
-
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
 
-function Fail([string]$msg) {
-    Write-Host "ERROR: $msg" -ForegroundColor Red
+# ── Usage ────────────────────────────────────────────────────────────────────
+function Show-Usage {
+    param([string]$ErrorText)
+    if ($ErrorText) { Write-Host "Error: $ErrorText" -ForegroundColor Red }
+    Write-Host 'Usage: set-version.ps1 -version <X.Y.Z|vX.Y.Z> -message "<msg>" [-force]'
+    Write-Host '  -version|--version   required, e.g. 1.2.3 or v1.2.3'
+    Write-Host '  -message|--message   required, commit + annotated-tag message'
+    Write-Host '  -force|--force       overwrite the tag if it already exists'
     exit 1
 }
 
-# ---------------------------------------------------------------------------
-# Validate and normalize version
-# ---------------------------------------------------------------------------
+# ── Parse named arguments (manual, so we accept -x and --x) ──────────────────
+$Version = $null
+$Message = $null
+$Force   = $false
 
-if ($Version -notmatch '^v') { $Version = "v$Version" }
-if ($Version -notmatch '^v\d+\.\d+\.\d+$') {
-    Fail "Version must look like v0.07.00 (got: $Version)"
+$known = @('-version', '--version', '-message', '--message', '-force', '--force')
+$i = 0
+while ($i -lt $args.Count) {
+    $a = [string]$args[$i]
+    switch -Regex ($a.ToLower()) {
+        '^--?version$' {
+            $i++
+            if ($i -ge $args.Count) { Show-Usage "Missing value for $a" }
+            $Version = [string]$args[$i]
+            break
+        }
+        '^--?force$' { $Force = $true; break }
+        '^--?message$' {
+            # Join trailing tokens up to the next known flag, so the message
+            # works whether quoted or passed as several unquoted words.
+            $i++
+            $parts = @()
+            while ($i -lt $args.Count -and $known -notcontains ([string]$args[$i]).ToLower()) {
+                $parts += [string]$args[$i]
+                $i++
+            }
+            $i--   # step back so the outer ++ lands on the next flag
+            $Message = ($parts -join ' ').Trim()
+            break
+        }
+        default { Show-Usage "Unknown argument: $a" }
+    }
+    $i++
 }
 
-$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $ProjectRoot
+if (-not $Version) { Show-Usage 'Missing required -version' }
+if ([string]::IsNullOrWhiteSpace($Message)) { Show-Usage 'Missing required -message' }
 
-# Verify we're in a git repo
-git rev-parse --git-dir 2>$null | Out-Null
-if ($LASTEXITCODE -ne 0) { Fail "Not in a git repository." }
+# ── Derive version strings ───────────────────────────────────────────────────
+$ver = $Version -replace '^v', ''
+if ($ver -notmatch '^\d+\.\d+(\.\d+(\.\d+)?)?$') {
+    Show-Usage "Invalid version '$Version' (expected X.Y.Z or vX.Y.Z)"
+}
+$tag  = "v$ver"
+$date = (Get-Date).ToString('dd-MMM-yyyy', [System.Globalization.CultureInfo]::InvariantCulture)
+$year = (Get-Date).Year
 
-# Make sure the tag doesn't already exist locally
-$existing = git tag --list $Version
-if ($existing) { Fail "Tag $Version already exists locally." }
+# Win32 VERSIONINFO needs a 4-part numeric tuple: split, int-cast, pad to 4.
+$parts = @($ver.Split('.') | ForEach-Object { [int]$_ })
+while ($parts.Count -lt 4) { $parts += 0 }
+$parts          = $parts[0..3]
+$winTuple       = ($parts -join ',')      # "1,2,3,0"
+$winTupleSpaced = ($parts -join ', ')     # "1, 2, 3, 0"
+$winDots        = ($parts -join '.')      # "1.2.3.0"
 
-# Make sure the tag doesn't already exist on the remote
-$remoteTag = git ls-remote --tags origin "refs/tags/$Version" 2>$null
-if ($remoteTag) { Fail "Tag $Version already exists on origin." }
+# ── Locate repo root ─────────────────────────────────────────────────────────
+$root = (& git rev-parse --show-toplevel 2>$null)
+if ($LASTEXITCODE -ne 0 -or -not $root) {
+    Write-Error 'Not inside a git repository.'
+    exit 1
+}
+$root = ($root | Select-Object -First 1).Trim()
+Set-Location $root
 
-# ---------------------------------------------------------------------------
-# Date components
-# ---------------------------------------------------------------------------
+Write-Host "Repo    : $root"
+Write-Host "Version : $ver  ->  tag $tag"
+Write-Host "Date    : $date"
+Write-Host ''
 
-$now             = Get-Date
-$monthShort      = $now.ToString('MMM')              # May
-$year            = $now.ToString('yyyy')             # 2026
-$dateForReadme   = $now.ToString('dd-MMM-yyyy')      # 25-May-2026
-$versionWithDate = "$Version ($monthShort-$year)"    # v0.07.00 (May-2026)
-
-Write-Host ""
-Write-Host "Setting project version to $Version" -ForegroundColor Cyan
-Write-Host "  build date string : $versionWithDate"
-Write-Host "  README date       : $dateForReadme"
-Write-Host ""
-
-# ---------------------------------------------------------------------------
-# Helpers for byte-faithful file rewrites (preserves line endings, no BOM)
-# ---------------------------------------------------------------------------
-
-$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-
-function Read-File([string]$path) {
-    return [System.IO.File]::ReadAllText($path)
+# ── Existing-tag guard ───────────────────────────────────────────────────────
+if ((git tag -l $tag) -eq $tag) {
+    if ($Force) {
+        Write-Host "Tag '$tag' exists - removing local tag (force)."
+        git tag -d $tag 2>&1 | ForEach-Object { Write-Host $_ }
+    }
+    else {
+        Write-Error "Tag '$tag' already exists. Re-run with -force, or delete it: git tag -d $tag"
+        exit 1
+    }
 }
 
-function Write-File([string]$path, [string]$content) {
-    [System.IO.File]::WriteAllText($path, $content, $utf8NoBom)
+# ── Force: clean up the remote tag and any published GitHub release ──────────
+# A GitHub release is a separate object from the tag; force-pushing the tag does
+# NOT remove it, so a CI step like `gh release create` would fail on the
+# duplicate. Remote cleanup is best-effort and needs an authenticated `gh`.
+if ($Force) {
+    function Test-GhReady {
+        if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { return $false }
+        & gh auth status 2>&1 | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    }
+    function Confirm-Delete {
+        param([string]$Prompt)
+        if ([Console]::IsInputRedirected) {
+            Write-Warning 'Non-interactive shell - not deleting the release. Re-run in a terminal to confirm.'
+            return $false
+        }
+        return ((Read-Host "$Prompt [y/N]") -match '^(y|yes)$')
+    }
+
+    if (Test-GhReady) {
+        & gh release view $tag 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $info = (& gh release view $tag --json name,tagName,assets `
+                        --jq '"\(.name)  (tag \(.tagName), \(.assets | length) asset(s))"' 2>$null)
+            Write-Host ''
+            Write-Host "A published GitHub release exists for $tag :" -ForegroundColor Yellow
+            Write-Host "  $info"
+            if (Confirm-Delete 'Delete this release and its assets?') {
+                & gh release delete $tag --yes 2>&1 | ForEach-Object { Write-Host $_ }
+                if ($LASTEXITCODE -eq 0) { Write-Host "Deleted : GitHub release $tag" }
+                else { Write-Warning "Could not delete release $tag (continuing)." }
+            }
+            else {
+                Write-Warning "Keeping release $tag - CI may fail to publish a duplicate."
+            }
+        }
+    }
+    else {
+        Write-Warning 'gh CLI not available/authenticated - skipping GitHub release cleanup.'
+    }
+
+    # Delete the remote tag so the re-push registers as a clean tag-create event.
+    Write-Host "Deleting: remote tag $tag (if present)"
+    git push origin ":refs/tags/$tag" 2>&1 | ForEach-Object { Write-Host $_ }
 }
 
-# ---------------------------------------------------------------------------
-# 1. brow-tool.py
-# ---------------------------------------------------------------------------
+# ── Helpers ──────────────────────────────────────────────────────────────────
+$changed = New-Object System.Collections.Generic.List[string]
+function Add-Changed { param([string]$Path) if (-not $changed.Contains($Path)) { $changed.Add($Path) } }
 
-$pyFile = Join-Path $ProjectRoot 'brow-tool.py'
-if (-not (Test-Path $pyFile)) { Fail "Python file not found: $pyFile" }
-
-$pyContent = Read-File $pyFile
-$pyPattern = 'VERSION\s*=\s*"v\d+\.\d+\.\d+\s*\([^)]+\)"'
-if (-not [regex]::IsMatch($pyContent, $pyPattern)) {
-    Fail "No VERSION line matching $pyPattern found in $pyFile"
-}
-$pyNew = [regex]::Replace($pyContent, $pyPattern, "VERSION = `"$versionWithDate`"")
-if ($pyNew -eq $pyContent) {
-    Write-Host "  brow-tool.py already at VERSION = `"$versionWithDate`" (no change)" -ForegroundColor DarkGray
-} else {
-    Write-File $pyFile $pyNew
-    Write-Host "  updated brow-tool.py    -> VERSION = `"$versionWithDate`""
+# Read a UTF-8 (or ASCII) text file, remembering whether it had a BOM so we can
+# write it back identically (Visual Studio frequently saves sources with a BOM).
+function Read-Utf8 {
+    param([string]$Path)
+    $bytes  = [System.IO.File]::ReadAllBytes($Path)
+    $hasBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+    $enc    = New-Object System.Text.UTF8Encoding($hasBom)
+    $offset = if ($hasBom) { 3 } else { 0 }
+    [pscustomobject]@{
+        Text     = $enc.GetString($bytes, $offset, $bytes.Length - $offset)
+        Encoding = $enc
+    }
 }
 
-# ---------------------------------------------------------------------------
-# 2. README.md
-# ---------------------------------------------------------------------------
+# Files under the repo, excluding build/VCS directories.
+function Get-RepoFiles {
+    param([string[]]$Include)
+    Get-ChildItem -Path $root -Recurse -File -Include $Include -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch '[\\/](\.git|bin|obj|node_modules|build|dist|out|packages|\.vs)[\\/]' }
+}
 
-$readme = Join-Path $ProjectRoot 'README.md'
+# Apply a UTF-8 text edit; write + record only when the content actually changes.
+function Edit-Utf8 {
+    param([string]$Path, [scriptblock]$Transform, [string]$Label)
+    $f = Read-Utf8 $Path
+    $new = & $Transform $f.Text
+    if ($new -ne $f.Text) {
+        [System.IO.File]::WriteAllText($Path, $new, $f.Encoding)
+        Add-Changed $Path
+        Write-Host "Updated : $Label"
+    }
+}
+
+# ── 1. VERSION (always, repo root, bare X.Y.Z) ───────────────────────────────
+$versionFile = Join-Path $root 'VERSION'
+[System.IO.File]::WriteAllText($versionFile, "$ver$([Environment]::NewLine)")
+Add-Changed $versionFile
+Write-Host "Updated : VERSION  ($ver)"
+
+# ── 2. README.md (version + date markers, both styles, case-insensitive) ─────
+$readme = Join-Path $root 'README.md'
 if (Test-Path $readme) {
-    $rmContent  = Read-File $readme
-    $verMarker  = '(<!-- VERSION -->)v?\d+\.\d+\.\d+'
-    $dateMarker = '(<!-- DATE -->)[\w\-]+'
+    Edit-Utf8 $readme {
+        param($t)
+        $t = [regex]::Replace($t, '(?i)(<!--\s*version\s*-->)v?[^\s<]*', "`${1}$tag")
+        $t = [regex]::Replace($t, '(?i)(<!--\s*date\s*-->)[^\r\n<]*',    "`${1}$date")
+        $t
+    } "README.md  (version=$tag  date=$date)"
+}
 
-    $hasVerMarker  = [regex]::IsMatch($rmContent, $verMarker)
-    $hasDateMarker = [regex]::IsMatch($rmContent, $dateMarker)
-    if (-not ($hasVerMarker -or $hasDateMarker)) {
-        Write-Host "  WARNING: No <!-- VERSION --> / <!-- DATE --> markers found in README.md" -ForegroundColor Yellow
-    } else {
-        $rmNew = $rmContent
-        $rmNew = [regex]::Replace($rmNew, $verMarker,  "`${1}$Version")
-        $rmNew = [regex]::Replace($rmNew, $dateMarker, "`${1}$dateForReadme")
-        if ($rmNew -eq $rmContent) {
-            Write-Host "  README.md already at $Version, $dateForReadme (no change)" -ForegroundColor DarkGray
-        } else {
-            Write-File $readme $rmNew
-            Write-Host "  updated README.md       -> $Version, $dateForReadme"
+# ── 3. C#: <Version> in any .csproj ──────────────────────────────────────────
+foreach ($f in Get-RepoFiles '*.csproj') {
+    $text = (Read-Utf8 $f.FullName).Text
+    if ($text -match '<Version>[^<]*</Version>') {
+        Edit-Utf8 $f.FullName {
+            param($t) [regex]::Replace($t, '<Version>[^<]*</Version>', "<Version>$ver</Version>")
+        } "$($f.Name)  (<Version>$ver</Version>)"
+    }
+}
+
+# ── 4. Python: __version__ = "X.Y.Z" ─────────────────────────────────────────
+foreach ($f in Get-RepoFiles @('version.py', '_version.py', '__init__.py')) {
+    $text = (Read-Utf8 $f.FullName).Text
+    if ($text -match '__version__\s*=') {
+        Edit-Utf8 $f.FullName {
+            param($t)
+            $t = [regex]::Replace($t, '(__version__\s*=\s*")[^"]*(")', "`${1}$ver`${2}")
+            $t = [regex]::Replace($t, "(__version__\s*=\s*')[^']*(')", "`${1}$ver`${2}")
+            $t
+        } "$($f.Name)  (__version__ = $ver)"
+    }
+}
+
+# ── 4b. Python: standalone-script literal  VERSION = "vX.Y.Z"  ──────────────
+# Some scripts are distributed as a single file (no sibling version.py), so
+# they hardcode VERSION instead of importing __version__.
+foreach ($f in Get-RepoFiles '*.py') {
+    $text = (Read-Utf8 $f.FullName).Text
+    if ($text -match '(?m)^\s*VERSION\s*=\s*["'']v?[0-9]') {
+        Edit-Utf8 $f.FullName {
+            param($t)
+            $t = [regex]::Replace($t, '(VERSION\s*=\s*")v?[^"]*(")', "`${1}$tag`${2}")
+            $t = [regex]::Replace($t, "(VERSION\s*=\s*')v?[^']*(')", "`${1}$tag`${2}")
+            $t
+        } "$($f.Name)  (VERSION = ""$tag"")"
+    }
+}
+
+# ── 5. PyInstaller: *version_info*.py tuples + version strings ───────────────
+foreach ($f in Get-RepoFiles '*version_info*.py') {
+    $text = (Read-Utf8 $f.FullName).Text
+    if ($text -match 'filevers\s*=') {
+        Edit-Utf8 $f.FullName {
+            param($t)
+            $t = [regex]::Replace($t, '(filevers\s*=\s*\()[^)]*(\))', "`${1}$winTupleSpaced`${2}")
+            $t = [regex]::Replace($t, '(prodvers\s*=\s*\()[^)]*(\))', "`${1}$winTupleSpaced`${2}")
+            $t = [regex]::Replace($t, "(u?'FileVersion',\s*u?')[^']*(')",    "`${1}$winDots`${2}")
+            $t = [regex]::Replace($t, "(u?'ProductVersion',\s*u?')[^']*(')", "`${1}$winDots`${2}")
+            $t
+        } "$($f.Name)  ($winDots)"
+    }
+}
+
+# ── 6. C++: #define VERSION / _VERSION "vX.Y.Z" ──────────────────────────────
+foreach ($f in Get-RepoFiles @('*.cpp', '*.cc', '*.cxx', '*.h', '*.hpp', '*.hh')) {
+    $text = (Read-Utf8 $f.FullName).Text
+    if ($text -match '#define\s+_?VERSION\s+"') {
+        Edit-Utf8 $f.FullName {
+            param($t) [regex]::Replace($t, '(#define\s+_?VERSION\s+")[^"]*(")', "`${1}$tag`${2}")
+        } "$($f.Name)  (#define VERSION ""$tag"")"
+    }
+}
+
+# ── 7. Win32 .rc: VERSIONINFO + string values + copyright year (UTF-16 LE) ───
+foreach ($f in Get-RepoFiles '*.rc') {
+    $unicode = [System.Text.Encoding]::Unicode
+    $t = [System.IO.File]::ReadAllText($f.FullName, $unicode)
+    if ($t -match 'FILEVERSION') {
+        $orig = $t
+        $t = [regex]::Replace($t, 'FILEVERSION\s+\d+,\s*\d+,\s*\d+,\s*\d+',                  "FILEVERSION $winTuple")
+        $t = [regex]::Replace($t, 'PRODUCTVERSION\s+\d+,\s*\d+,\s*\d+,\s*\d+',               "PRODUCTVERSION $winTuple")
+        $t = [regex]::Replace($t, '(VALUE\s+"FileVersion",\s+)"[^"]*"',                      "`${1}`"$winDots`"")
+        $t = [regex]::Replace($t, '(VALUE\s+"ProductVersion",\s+)"[^"]*"',                   "`${1}`"$winDots`"")
+        $t = [regex]::Replace($t, '(VALUE\s+"LegalCopyright",\s+"[^"]*Copyright \(C\) )\d{4}', "`${1}$year")
+        if ($t -ne $orig) {
+            [System.IO.File]::WriteAllText($f.FullName, $t, $unicode)
+            Add-Changed $f.FullName
+            Write-Host "Updated : $($f.Name)  ($winDots  (c) $year)"
         }
     }
 }
 
-# ---------------------------------------------------------------------------
-# 3. VERSION file
-# ---------------------------------------------------------------------------
-
-$versionFile = Join-Path $ProjectRoot 'VERSION'
-Write-File $versionFile "$Version`n"
-Write-Host "  updated VERSION         -> $Version"
-
-# ---------------------------------------------------------------------------
-# Git: stage, commit
-# ---------------------------------------------------------------------------
-
-Write-Host ""
-Write-Host "Staging and committing..." -ForegroundColor Cyan
-
-git add -A
-if ($LASTEXITCODE -ne 0) { Fail "git add failed." }
-
-git diff --cached --quiet
-if ($LASTEXITCODE -eq 0) {
-    Fail "Nothing to commit. (Did the version files already match?)"
+# ── Commit, tag, push ────────────────────────────────────────────────────────
+# Wrap git so its stderr (warnings) doesn't get turned into a fatal ErrorRecord
+# by ErrorActionPreference=Stop; fail only on a non-zero exit code.
+function Invoke-Git {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$GitArgs)
+    & git @GitArgs 2>&1 | ForEach-Object { Write-Host $_ }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error ("git " + ($GitArgs -join ' ') + " failed (exit $LASTEXITCODE)")
+        exit 1
+    }
 }
 
-git commit -m $Message
-if ($LASTEXITCODE -ne 0) { Fail "git commit failed." }
+Write-Host ''
+Invoke-Git @(@('add', '--') + $changed)
+Invoke-Git commit -m $Message
+Invoke-Git tag -a $tag -m $Message
+Write-Host "Tagged  : $tag"
 
-# ---------------------------------------------------------------------------
-# Push commits FIRST, then tag.
-# This order matters: the GitHub Action is triggered by the tag push, and we
-# want the commit to already be on the remote when the action checks out.
-# ---------------------------------------------------------------------------
+# Push branch and tag as SEPARATE operations so GitHub delivers two webhook
+# events; --follow-tags can coalesce them and skip the tag-triggered release.
+Write-Host 'Pushing : branch -> origin'
+Invoke-Git push origin HEAD
+Write-Host "Pushing : tag $tag -> origin"
+if ($Force) { Invoke-Git push origin $tag --force } else { Invoke-Git push origin $tag }
 
-Write-Host ""
-Write-Host "Pushing commits..." -ForegroundColor Cyan
-git push
-if ($LASTEXITCODE -ne 0) { Fail "git push failed." }
-
-Write-Host ""
-Write-Host "Creating annotated tag $Version..." -ForegroundColor Cyan
-git tag -a $Version -m $Message
-if ($LASTEXITCODE -ne 0) { Fail "git tag failed." }
-
-Write-Host "Pushing tag $Version (this triggers the release workflow)..."
-git push origin $Version
-if ($LASTEXITCODE -ne 0) { Fail "git push origin $Version failed." }
-
-Write-Host ""
-Write-Host "Done. Tag $Version pushed." -ForegroundColor Green
-Write-Host "The GitHub Action should now be building macOS + Windows binaries."
-Write-Host "Watch progress at: https://github.com/landenlabs/browser-tools/actions"
+Write-Host ''
+Write-Host "Done. Pushed $tag - CI build + release should now run."

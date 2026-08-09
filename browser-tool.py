@@ -15,7 +15,7 @@ import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 
-VERSION = "v6.05.23 (May-2026)"
+VERSION = "v6.05.23"
 
 
 # ---------------------------------------------------------------------------
